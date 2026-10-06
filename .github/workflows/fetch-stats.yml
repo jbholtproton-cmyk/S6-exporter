@@ -1,9 +1,14 @@
 name: Export Bhuryn Siege stats
 
-# Manual only. No push trigger, recurring schedule, or account credentials.
+# Run manually, or when the exporter/workflow changes on main.
 on:
   workflow_dispatch:
-
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/fetch-stats.yml'
+      - 'export-bhuryn.cjs'
 permissions:
   contents: read
 
