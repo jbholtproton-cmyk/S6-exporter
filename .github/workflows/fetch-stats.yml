@@ -1,1 +1,111 @@
+name: Export Bhuryn Siege stats
 
+# Manual only. No push trigger, recurring schedule, or account credentials.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bhuryn-stats-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: 'true'
+
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up compatible Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '>=24.15.0 <25'
+          check-latest: true
+          package-manager-cache: false
+
+      # Use the exact source revision inspected for this exporter, not an
+      # unverified npm release that may expose the older v1 API.
+      - name: Check out the pinned statistics client
+        uses: actions/checkout@v7
+        with:
+          repository: hmes98318/r6s-stats-api
+          ref: 29fad493c4265a718720818d928083c63c50e095
+          path: vendor/r6s-stats-api
+          persist-credentials: false
+
+      - name: Install the client's locked dependencies and browser
+        working-directory: vendor/r6s-stats-api
+        run: |
+          set -o pipefail
+          npm ci --no-audit --no-fund 2>&1 | tee "$GITHUB_WORKSPACE/client-install.log"
+
+      - name: Install Linux browser libraries
+        working-directory: vendor/r6s-stats-api
+        run: |
+          set -o pipefail
+          npx --no-install playwright install-deps chromium 2>&1 | tee "$GITHUB_WORKSPACE/browser-deps.log"
+
+      - name: Build the client
+        working-directory: vendor/r6s-stats-api
+        run: |
+          set -o pipefail
+          npm run build 2>&1 | tee "$GITHUB_WORKSPACE/client-build.log"
+
+      - name: Export public stats for Bhuryn
+        env:
+          R6_CLIENT_MODULE: ${{ github.workspace }}/vendor/r6s-stats-api/dist/index.js
+        run: |
+          set -o pipefail
+          node export-bhuryn.cjs 2>&1 | tee exporter.log
+
+      - name: Write a result summary even when the export fails
+        if: ${{ always() }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const reports = fs.readdirSync('.').filter(name => /^Bhuryn-stats-.*\.json$/.test(name)).sort();
+          let lines = ['## Bhuryn stats export', ''];
+          if (!reports.length) {
+            lines.push('No stats JSON was created. Inspect the failed setup or export step; this is not a successful refresh.');
+          } else {
+            try {
+              const file = reports.at(-1);
+              const report = JSON.parse(fs.readFileSync(file, 'utf8'));
+              lines.push(`Export status: **${report.status}**`, `File: \`${file}\``, '', '| Section | Result |', '|---|---|');
+              for (const [name, section] of Object.entries(report.sections ?? {})) {
+                const error = section.error?.code ? ` (${section.error.code})` : '';
+                lines.push(`| ${name} | ${section.status}${error} |`);
+              }
+              lines.push('', 'A saved JSON file may contain errors or partial data. Verify identity, season and playlist before comparing numbers.');
+            } catch {
+              lines.push('The result JSON could not be parsed. Do not treat this run as a verified stats refresh.');
+            }
+          }
+          lines.push('', 'Read-only public Tracker data. No Ubisoft login, cookies, or 2FA codes are used.');
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
+          NODE
+
+      - name: Save available results and diagnostic logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bhuryn-stats-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            Bhuryn-stats-*.json
+            exporter.log
+            client-install.log
+            client-build.log
+            browser-deps.log
+          if-no-files-found: warn
+          retention-days: 14
