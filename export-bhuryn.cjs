@@ -123,7 +123,7 @@ async function main() {
   console.log('Read-only public Tracker export. No Ubisoft sign-in required.');
   console.log(`Output: ${output}`);
 const client = createClient({
-  timeoutMs: 60000,
+  timeoutMs: 240000,
   retries: 0,
   minRequestIntervalMs: 1000
 });
