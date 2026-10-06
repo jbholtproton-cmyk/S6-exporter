@@ -122,7 +122,11 @@ async function main() {
   save();
   console.log('Read-only public Tracker export. No Ubisoft sign-in required.');
   console.log(`Output: ${output}`);
-  const client = createClient({ timeoutMs: 15000, retries: 0, minRequestIntervalMs: 1000 });
+const client = createClient({
+  timeoutMs: 60000,
+  retries: 0,
+  minRequestIntervalMs: 1000
+});
   // Hard cap prevents an upstream/browser stall from leaving this running indefinitely.
   const watchdog = setTimeout(() => {
     report.status = Object.values(report.sections).some(section => section.status === 'retrieved') ? 'partial' : 'failed';
