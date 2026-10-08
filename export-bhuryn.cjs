@@ -101,13 +101,15 @@ async function collect(client, report, save, log = console.log) {
 function safeUrl(value) {
   try {
     const u = new URL(String(value));
-    return `${u.origin}${u.pathname}${u.search ? '?[redacted]' : ''}`;
+    const pathname = u.pathname.startsWith('/cdn-cgi/challenge-platform/') ? '/cdn-cgi/challenge-platform/[redacted]' : u.pathname;
+    return `${u.origin}${pathname}${u.search ? '?[redacted]' : ''}`;
   } catch { return '[unavailable URL]'; }
 }
 function scrub(value, maximum = 1000) {
   return String(value ?? '')
     .replace(/https?:\/\/[^\s<>"']+/gi, match => safeUrl(match))
     .replace(/\bBearer\s+[^\s,;]+/gi, 'Bearer [redacted]')
+    .replace(/(["']?(?:access_token|refresh_token|id_token|password|authorization|cookie)["']?\s*[:=]\s*)["'][^"']*["']/gi, '$1[redacted]')
     .replace(/\b(?:access_token|refresh_token|id_token|password|authorization|cookie)\s*[:=]\s*[^\s,;]+/gi, '[redacted credential]')
     .replace(/\beyJ[\w-]+\.[\w-]+\.[\w-]+\b/g, '[redacted token]')
     .replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, '')
@@ -132,6 +134,68 @@ async function bounded(operation, milliseconds) {
 }
 
 /**
+ * Capture browser-reported network failures, including CORS/block reasons when
+ * Chromium supplies them. Never read headers, cookies, POST bodies or storage.
+ * This only observes: no routing, injected fetches, security changes or retries.
+ */
+async function observeNetwork(context, page, info, event, persist, log) {
+  let session;
+  let active = true;
+  const requests = new Map();
+  info.networkDetailStatus = 'attaching';
+  try {
+    session = await bounded(context.newCDPSession(page), 2000);
+    session.on('Network.requestWillBeSent', data => {
+      const raw = data.request?.url;
+      if (!active || !isTrackerUrl(raw)) return;
+      if (requests.size >= 400 && !requests.has(data.requestId)) requests.delete(requests.keys().next().value);
+      const item = { url: safeUrl(raw), method: scrub(data.request?.method, 20), resourceType: scrub(data.type, 40), status: null };
+      requests.set(data.requestId, item);
+      event('network_request', { page: info.index, ...item });
+    });
+    // This can expose the response status even when browser policy prevents
+    // Playwright's normal response event. Response headers are not inspected.
+    session.on('Network.responseReceivedExtraInfo', data => {
+      const item = requests.get(data.requestId);
+      if (!active || !item) return;
+      item.status = Number.isInteger(data.statusCode) ? data.statusCode : null;
+      event('network_response_status', { page: info.index, url: item.url, method: item.method, status: item.status });
+    });
+    session.on('Network.loadingFailed', data => {
+      const item = requests.get(data.requestId);
+      if (!active || !item) return;
+      const failure = {
+        page: info.index, url: item.url, method: item.method, resourceType: scrub(data.type, 40),
+        responseStatus: item.status, error: scrub(data.errorText, 300),
+        canceled: typeof data.canceled === 'boolean' ? data.canceled : null,
+        blockedReason: data.blockedReason ? scrub(data.blockedReason, 200) : null,
+        corsError: data.corsErrorStatus?.corsError ? scrub(data.corsErrorStatus.corsError, 200) : null,
+        failedParameter: data.corsErrorStatus?.failedParameter ? scrub(data.corsErrorStatus.failedParameter, 200) : null
+      };
+      event('network_loading_failed', failure);
+      log(`[diagnostics] Network failure: ${failure.method} ${failure.url}; ${failure.error}; HTTP=${failure.responseStatus ?? 'not exposed'}; blocked=${failure.blockedReason ?? 'not supplied'}; CORS=${failure.corsError ?? 'not supplied'}`);
+      persist();
+    });
+    session.on('Log.entryAdded', ({entry}) => {
+      if (!active || !entry || !['network', 'security'].includes(entry.source)) return;
+      if (entry.url && !isTrackerUrl(entry.url)) return;
+      const text = scrub(entry.text, 1600);
+      if (!/tracker\.(gg|network)|cors|cross.origin|preflight|net::ERR_|content security policy/i.test(text)) return;
+      event('browser_network_log', { page: info.index, source: entry.source, level: scrub(entry.level, 30), url: entry.url ? safeUrl(entry.url) : null, text });
+      persist();
+    });
+    await bounded(Promise.all([session.send('Network.enable'), session.send('Log.enable')]), 2000);
+    info.networkDetailStatus = 'attached';
+  } catch (error) {
+    active = false;
+    info.networkDetailStatus = 'unavailable';
+    info.networkDetailError = scrub(error?.message, 400);
+    if (session) { try { await bounded(session.detach(), 500); } catch {} }
+  }
+  persist();
+}
+
+/**
  * Observe the EXISTING client's Chromium session. This wraps launch/newContext/
  * close only to attach listeners and take a final snapshot; all supplied launch
  * settings, navigation, response predicates and requests remain unchanged.
@@ -142,7 +206,7 @@ async function bounded(operation, milliseconds) {
 function observeChromium(chromium, report, save, log = console.log) {
   const expected = `https://api.tracker.gg/api/v2/r6siege/standard/profile/${PLATFORM}/${encodeURIComponent(PLAYER)}`;
   const d = report.diagnostics = {
-    kind: 'public-browser-observation-v1',
+    kind: 'public-browser-observation-v2',
     installed: true,
     browserLaunched: false,
     expectedProfileApiUrl: expected,
@@ -153,6 +217,7 @@ function observeChromium(chromium, report, save, log = console.log) {
     pages: [],
     limitations: [
       'Only the existing browser fallback is observed; initial direct HTTP traffic is not captured.',
+      'Network failure and CORS/block reasons are browser-reported and may be absent; no missing reason is inferred.',
       'Response events report arrival of response headers, not completion of JSON parsing.',
       'Snapshots describe a public browser page, not a verified stats export.',
       'URL queries are redacted; no cookies, storage, credentials or request bodies are exported.',
@@ -179,9 +244,10 @@ function observeChromium(chromium, report, save, log = console.log) {
     const newContext = browser.newContext;
     browser.newContext = async function (...args) {
       const context = await newContext.apply(this, args);
+      const attaching = new WeakMap();
       context.on('page', page => {
         if (pages.length >= 3) { event('page_observation_limit'); return; }
-        const info = { index: pages.length, finalUrl: null, pageErrors: [], consoleErrorCount: 0 };
+        const info = { index: pages.length, finalUrl: null, pageErrors: [], consoleErrorCount: 0, consoleNetworkErrors: [] };
         pages.push({ page, info });
         d.pages.push(info);
         page.on('request', request => {
@@ -212,8 +278,17 @@ function observeChromium(chromium, report, save, log = console.log) {
         page.on('pageerror', error => {
           if (info.pageErrors.length < 12) info.pageErrors.push(scrub(error?.message));
         });
-        // Do not dump console arguments, which could contain session material.
-        page.on('console', message => { if (message.type() === 'error') info.consoleErrorCount++; });
+        // Only retain relevant, scrubbed text; never evaluate console arguments.
+        page.on('console', message => {
+          if (message.type() !== 'error') return;
+          info.consoleErrorCount++;
+          const text = scrub(message.text(), 1600);
+          if (info.consoleNetworkErrors.length < 24 && /cors|cross.origin|preflight|net::ERR_|failed to (?:load|fetch)|network.?error|content security policy/i.test(text)) {
+            info.consoleNetworkErrors.push(text);
+            persist();
+          }
+        });
+        attaching.set(page, observeNetwork(context, page, info, event, persist, log));
         page.on('framenavigated', frame => {
           if (frame === page.mainFrame()) {
             info.finalUrl = safeUrl(page.url());
@@ -221,6 +296,13 @@ function observeChromium(chromium, report, save, log = console.log) {
           }
         });
       });
+      // Wait for the observer before the caller begins its normal navigation.
+      const newPage = context.newPage;
+      if (typeof newPage === 'function') context.newPage = async function (...pageArgs) {
+        const page = await newPage.apply(this, pageArgs);
+        await attaching.get(page);
+        return page;
+      };
       return context;
     };
     async function snapshot({page, info}) {
@@ -287,7 +369,7 @@ function finalFailure(report, error, phase) {
 
 async function main() {
   const report = makeReport();
-  report.exporterRevision = '2026-10-07-browser-diagnostics-1';
+  report.exporterRevision = '2026-10-07-browser-diagnostics-2';
   report.execution = { commit: process.env.GITHUB_SHA ?? null, runId: process.env.GITHUB_RUN_ID ?? null, attempt: process.env.GITHUB_RUN_ATTEMPT ?? null, requestTimeoutMs: 60000, overallTimeoutMs: 180000 };
   const stamp = report.startedAt.replace(/[:.]/g, '-');
   const output = path.join(__dirname, `Bhuryn-stats-${stamp}.json`);
@@ -360,7 +442,7 @@ async function main() {
   }
 }
 
-module.exports = { collect, makeReport, SECTIONS, observeChromium, safeUrl, scrub, finalFailure };
+module.exports = { collect, makeReport, SECTIONS, observeChromium, observeNetwork, safeUrl, scrub, finalFailure };
 if (require.main === module) main().catch(error => {
   console.error(`Fatal exporter error: ${scrub(error?.message)}`);
   process.exitCode = 1;
